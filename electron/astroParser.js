@@ -1060,23 +1060,37 @@ function serializeNodeMarked(node, indent, lines, path, inSlot = false) {
   } else if (node.kind === 'map') {
     // Loop children render once per item, so their marker pairs repeat in
     // the DOM — the collector unions every instance into one region.
+    //
+    // …and, exactly as in the `cond` branch below, those children go inside a
+    // <Fragment>. A marked child emits at least three things — its opening
+    // marker, its contents, its closing marker — and an arrow body wrapped in
+    // parens holds ONE expression, not a list. Without the wrapper,
+    // `items.map((i) => ( <!--avb-s--> <li/> <!--avb-e--> ))` is invalid and
+    // the compiler fails with a bare "Unexpected token", which surfaces as a
+    // 500 with no file or position because the error crosses the dev runner
+    // boundary. Fragment renders no element, so the markers stay siblings of
+    // the content in the DOM, which is what the canvas needs.
     lines.push(indent + '{');
     if (node.body && node.body.length) {
       lines.push(indent + '  ' + blockHead(node.head));
       for (const line of node.body) lines.push(indent + '    ' + line);
       lines.push(indent + '    return (');
+      lines.push(indent + '      <Fragment>');
       (node.children || []).forEach((child, i) =>
-        serializeNodeMarked(child, indent + '      ', lines, `${path}.${i}`, inSlot)
+        serializeNodeMarked(child, indent + '        ', lines, `${path}.${i}`, inSlot)
       );
+      lines.push(indent + '      </Fragment>');
       lines.push(indent + '    );');
       lines.push(indent + '  })');
       lines.push(indent + '}');
       return;
     }
     lines.push(indent + '  ' + node.head);
+    lines.push(indent + '    <Fragment>');
     (node.children || []).forEach((child, i) =>
-      serializeNodeMarked(child, indent + '    ', lines, `${path}.${i}`, inSlot)
+      serializeNodeMarked(child, indent + '      ', lines, `${path}.${i}`, inSlot)
     );
+    lines.push(indent + '    </Fragment>');
     lines.push(indent + '  ))');
     lines.push(indent + '}');
   } else if (node.kind === 'cond') {

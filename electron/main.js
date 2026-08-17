@@ -601,7 +601,8 @@ function listAstroFiles(dir) {
   if (!fs.existsSync(dir)) return [];
   const out = [];
   const walk = (d) => {
-    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+    const entries = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
       const full = path.join(d, entry.name);
       if (entry.isDirectory()) walk(full);
       // Markdown only counts as a page. A .md under src/components isn't a
@@ -906,7 +907,8 @@ ipcMain.handle('project:scan', async (_e, projectPath) => {
   const pageFolders = [];
   if (fs.existsSync(pagesDir)) {
     const walkDirs = (d) => {
-      for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const entries = fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         const full = path.join(d, entry.name);
         pageFolders.push(toPosix(path.relative(pagesDir, full)));
