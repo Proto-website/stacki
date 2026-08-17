@@ -22,9 +22,11 @@ import InsertSearch from './ui/InsertSearch.jsx';
 import AssetsPanel from './panels/AssetsPanel.jsx';
 import CmsPanel from './panels/CmsPanel.jsx';
 import CmsView from './panels/CmsView.jsx';
+import TerminalDock from './panels/TerminalDock.jsx';
 import { getElementSchema, GLOBAL_ATTRS, canContainTag, HTML_TAGS } from './elementSchemas.js';
 import { onAssetRequest, clearAssetRequest } from './assetPick.js';
 import { isDataBound } from './bindings.js';
+import { cleanError, stripAnsi } from './cleanError.js';
 import { elementLabel } from './classNames.js';
 import { findImportOf } from './dataSuggest.js';
 import {
@@ -33,6 +35,7 @@ import {
   ExternalIcon,
   ChevronLeftIcon,
   ElementComponentIcon,
+  TerminalIcon,
 } from './ui/Icons.jsx';
 
 let idCounter = 1000;
@@ -483,8 +486,10 @@ export default function App() {
   const [cmsSettings, setCmsSettings] = useState(false); // editing that collection's fields
   const [inPreview, setInPreview] = useState(false); // interactive full-site preview
   const [previewSrc, setPreviewSrc] = useState(null);
+  const [termOpen, setTermOpen] = useState(false); // bottom terminal dock
   const [codeWin, setCodeWin] = useState(null); // {targetId|kind:'file', title, language}
   const openCodeWindowRef = useRef(null); // latest openCodeWindow, for the Enter shortcut
+  const selectionKeysRef = useRef([]); // node keys ⇧⌘C resolves to file:line
   const [fileText, setFileText] = useState(''); // loaded text for kind:'file'
   // Breakpoint lives here, not in PreviewPane: a re-mount of that pane must
   // not silently drop the user out of the view they picked (which would
@@ -683,6 +688,20 @@ export default function App() {
     [rescan, startPreview] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // "Reload All Code" (dev, ⌘R) restarts the whole process to pick up main and
+  // preload changes, leaving the open project behind for the new one. Reopen it
+  // so the reload lands where you were instead of on the welcome screen. Returns
+  // null on a normal launch and in packaged builds, so nothing else changes.
+  const reopenedRef = useRef(false);
+  useEffect(() => {
+    if (reopenedRef.current || !window.avb.devReopen) return;
+    reopenedRef.current = true;
+    window.avb
+      .devReopen()
+      .then((p) => p && loadProject(p))
+      .catch(() => {});
+  }, [loadProject]);
+
   // ----------------------------------------------------------------
   // Page loading & saving
   // ----------------------------------------------------------------
@@ -838,7 +857,15 @@ export default function App() {
       // keeps the outermost instance as the focus: a nested component's
       // internals aren't addressable in the page's own markers.
       const focusPath = stack[stack.length - 1]?.focusPath ?? hostPath ?? null;
-      const entry = { kind: 'component', name: comp.name, path: comp.path, focusPath };
+      // focusPath collapses to the outermost instance; hostKey keeps this
+      // level's own, which is what the selection trail walks down.
+      const entry = {
+        kind: 'component',
+        name: comp.name,
+        path: comp.path,
+        focusPath,
+        hostKey: hostPath ?? null,
+      };
       setEditStack((s) =>
         s.some((e) => e.path === comp.path) ? s : [...s, entry]
       );
@@ -1366,6 +1393,23 @@ export default function App() {
   // Insert palette (⌘F / ⌘E) — quick-add components, tags, loops, …
   // ----------------------------------------------------------------
 
+  // ⌘J / ⌃` toggle the terminal dock, the two bindings people already have in
+  // their fingers. Both carry a modifier, so they still work while a text field
+  // or the terminal itself has focus — unlike the rail's bare-letter shortcuts.
+  useEffect(() => {
+    const onKey = (e) => {
+      const mod = e.metaKey || e.ctrlKey;
+      const isToggle =
+        (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'j') ||
+        (e.ctrlKey && !e.metaKey && !e.altKey && e.key === '`');
+      if (!isToggle) return;
+      e.preventDefault();
+      setTermOpen((v) => !v);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const [insertOpen, setInsertOpen] = useState(false);
 
   // Open requests from the app menu (⌘E accelerator) and from canvas
@@ -1747,9 +1791,22 @@ export default function App() {
           pasteNode();
         }
       }),
+      // ⇧⌘C — the selection's file:line trail, for pasting into an AI chat.
+      // Copies markup coordinates, not markup: ⌘C already does the node.
+      window.avb.onMenu('copySelection', async () => {
+        // The lines are read off the file on disk, and typing is saved on a
+        // 300 ms debounce — land the pending edit first or they're one edit old.
+        await flushSave();
+        const res = await window.avb.copySelection({
+          projectPath: projectRef.current?.path,
+          keys: selectionKeysRef.current,
+        });
+        if (res?.ok) showToast('Selection copied — paste it into your AI chat.');
+        else showToast('Nothing selected to copy.', 'error');
+      }),
     ];
     return () => offs.forEach((off) => off());
-  }, [undo, redo, copyNode, pasteNode]);
+  }, [undo, redo, copyNode, pasteNode, flushSave, showToast]);
 
   // ----------------------------------------------------------------
   // Interactive preview mode — browse the site inside the app; on exit,
@@ -2979,6 +3036,38 @@ export default function App() {
   // The right panel stays on whichever tab the user picked, whatever gets
   // selected next. (S / D switch it by hand.)
 
+  // What ⇧⌘C copies: the route an editor would take to reach the selection —
+  // the page, the instance of each component drilled into on the way down,
+  // then the node itself — so an agent reading it lands on the markup the user
+  // is looking at, not on some other use of the same component. With nothing
+  // selected the open file alone still says where the user is.
+  //
+  // Deliberately "<file>#<index path>" rather than a marker path: a marker is
+  // namespaced only when it names a component, and every entry here needs to
+  // say which file it belongs to. The file is the one open at that level of the
+  // stack, so it's read from the stack rather than parsed out of the key.
+  // Through a ref because the menu handler is bound long before this is in scope.
+  const relOf = (abs) =>
+    abs && project?.path ? abs.replace(project.path + '/', '') : null;
+  const openRel = relOf(currentPage?.path);
+  const leafTrail = model && selectedId ? pathOfNode(model.nodes, selectedId) : null;
+  selectionKeysRef.current = !openRel
+    ? []
+    : [
+        ...editStack
+          .slice(1)
+          .map((entry, i) => {
+            const host = relOf(editStack[i].path);
+            return entry.hostKey && host ? `${host}#${trailOf(entry.hostKey).join('.')}` : null;
+          })
+          .filter(Boolean),
+        selectedId === 'frontmatter'
+          ? `${openRel}#frontmatter`
+          : leafTrail
+            ? `${openRel}#${leafTrail.join('.')}`
+            : `${openRel}#`,
+      ];
+
   // Position the Style/Settings highlight: on tab change, when the panel first
   // appears, and whenever the tab strip's width changes.
   useLayoutEffect(() => {
@@ -3122,6 +3211,13 @@ export default function App() {
         <span className="spacer" />
         {/* Both ways of viewing the site, kept together. */}
         <div className="titlebar-actions">
+          <button
+            className={`titlebar-btn ${termOpen ? 'on' : ''}`}
+            title={termOpen ? 'Hide terminal (⌘J)' : 'Show terminal (⌘J)'}
+            onClick={() => setTermOpen((v) => !v)}
+          >
+            <TerminalIcon size={14} />
+          </button>
           <button
             className="titlebar-btn"
             title="Open in browser"
@@ -3444,6 +3540,16 @@ export default function App() {
         )}
       </div>
 
+      {/* Below `.main`, so it spans the full window rather than being boxed in
+          by the panels. Always mounted but inert until opened: it spawns no
+          shell until then, and once open it hides rather than unmounting, so
+          toggling it doesn't discard the scrollback — see TerminalDock. */}
+      <TerminalDock
+        projectPath={project.path}
+        open={termOpen}
+        onClose={() => setTermOpen(false)}
+      />
+
       {codeWin && codeWinValue !== null && (
         <CodeWindow
           title={codeWin.title}
@@ -3506,14 +3612,3 @@ function Toast({ toast }) {
   return <div className={`toast ${toast.kind}`}>{toast.msg}</div>;
 }
 
-export function cleanError(err) {
-  const msg = err?.message || String(err);
-  return stripAnsi(msg.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, ''));
-}
-
-function stripAnsi(s) {
-  return String(s)
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-    .replace(/\x1b/g, '')
-    .replace(/\[(\d{1,2})m/g, '');
-}

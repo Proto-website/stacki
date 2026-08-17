@@ -244,16 +244,23 @@ function splitBlockLoopBody(block) {
 // declarations back out in the shape it was written in.
 const blockHead = (head) => head.replace(/\($/, '{');
 
-function tryParseMap(exprText) {
+// `base`, when a number, is the offset of exprText's '{' in the file (see
+// parseTemplate) so the loop's children carry source offsets too.
+function tryParseMap(exprText, base = null) {
   const inner = exprText.slice(1, -1); // strip the outer { }
+  const innerBase = base === null ? null : base + 1;
   // Every form is tried: the concise matcher's lazy prefix can run past a
   // block body's `=> {`, or past a bare body's `=> <`, and match a NESTED
   // `.map((t) => (` in its markup, so its failure says nothing about whether
   // this is a block-bodied or paren-less loop.
-  return tryParseConciseMap(inner) || tryParseBareMap(inner) || tryParseBlockMap(inner);
+  return (
+    tryParseConciseMap(inner, innerBase) ||
+    tryParseBareMap(inner, innerBase) ||
+    tryParseBlockMap(inner, innerBase)
+  );
 }
 
-function tryParseConciseMap(inner) {
+function tryParseConciseMap(inner, base = null) {
   // The callback's parameter list may be parenthesized — `(post)`, `(post, i)`,
   // `([k, v])` — or a bare name, which is how many people write a one-argument
   // arrow. Both are the same loop; only the first used to be recognized.
@@ -268,7 +275,7 @@ function tryParseConciseMap(inner) {
   // After the body must come only the .map() close paren.
   if (!/^\s*\)\s*$/.test(inner.slice(closeIdx + 1))) return null;
   const body = inner.slice(openIdx + 1, closeIdx);
-  const parsed = parseTemplate(body);
+  const parsed = parseTemplate(body, base === null ? null : base + openIdx + 1);
   if (!parsed.clean) return null;
   return {
     id: makeId(),
@@ -288,7 +295,7 @@ function tryParseConciseMap(inner) {
 // The body runs to the `)` that closes `.map(`, so that paren is found rather
 // than assumed. Normalized to the same node the parenthesized form produces,
 // with `bare` remembering how it was written.
-function tryParseBareMap(inner) {
+function tryParseBareMap(inner, base = null) {
   const arrow = inner.match(
     /^([\s\S]*?\.map\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*)</
   );
@@ -299,7 +306,10 @@ function tryParseBareMap(inner) {
   if (mapClose === -1) return null;
   // After the body must come only the .map() close paren.
   if (inner.slice(mapClose + 1).trim()) return null;
-  const parsed = parseTemplate(inner.slice(headRaw.length, mapClose));
+  const parsed = parseTemplate(
+    inner.slice(headRaw.length, mapClose),
+    base === null ? null : base + headRaw.length
+  );
   if (!parsed.clean) return null;
   return {
     id: makeId(),
@@ -313,7 +323,7 @@ function tryParseBareMap(inner) {
 // The same loop, written with a statement body. Normalized to the same node
 // the concise form produces — head ending in `=> (` so the Loop editor reads
 // it unchanged — with the declarations parked in `body` for serializing back.
-function tryParseBlockMap(inner) {
+function tryParseBlockMap(inner, base = null) {
   const arrow = inner.match(
     /^([\s\S]*?\.map\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*)\{/
   );
@@ -324,9 +334,18 @@ function tryParseBlockMap(inner) {
   if (closeIdx === -1) return null;
   // After the block must come only the .map() close paren.
   if (!/^\s*\)\s*$/.test(inner.slice(closeIdx + 1))) return null;
-  const split = splitBlockLoopBody(inner.slice(openIdx + 1, closeIdx));
+  const blockText = inner.slice(openIdx + 1, closeIdx);
+  const split = splitBlockLoopBody(blockText);
   if (!split) return null;
-  const parsed = parseTemplate(split.markup);
+  // The markup was pulled out of `blockText` through several trims and a
+  // paren-strip, so its own offset isn't tracked through that — found here by
+  // searching for it instead of computed, which is exact as long as the
+  // returned markup text doesn't recur earlier in the block.
+  const markupAt = blockText.indexOf(split.markup);
+  const parsed = parseTemplate(
+    split.markup,
+    base === null || markupAt === -1 ? null : base + openIdx + 1 + markupAt
+  );
   if (!parsed.clean) return null;
   return {
     id: makeId(),
@@ -394,11 +413,20 @@ function topLevelOps(src) {
 
 // One side of a conditional, as child nodes. `null` means "this isn't markup",
 // which sends the whole expression back to being opaque code.
-function branchNodes(raw) {
-  let t = String(raw).trim();
+function branchNodes(raw, base = null) {
+  let t = String(raw);
+  let off = 0;
+  const trimStart = () => {
+    const stripped = t.trimStart();
+    off += t.length - stripped.length;
+    t = stripped.trimEnd();
+  };
+  trimStart();
   // Peel the wrapping parens the JSX convention adds: `? ( <img/> ) :`.
   while (t.startsWith('(') && findMatchingParen(t, 0) === t.length - 1) {
-    t = t.slice(1, -1).trim();
+    t = t.slice(1, -1);
+    off += 1;
+    trimStart();
   }
   // The ways of writing "render nothing here".
   if (t === '' || /^(null|undefined|false|''|"")$/.test(t)) return [];
@@ -406,14 +434,14 @@ function branchNodes(raw) {
     // A failed probe must not claim the page's bail message — the caller
     // falls back to an expression node and the page still parses.
     const saved = lastBail;
-    const parsed = parseTemplate(t);
+    const parsed = parseTemplate(t, base === null ? null : base + off);
     if (parsed.clean) return parsed.nodes;
     lastBail = saved;
     return null;
   }
   // `a ? (…) : b ? (…) : (…)` — an else-if chain, which reads as a condition
   // nested in the else branch.
-  const nested = parseCondSource(t);
+  const nested = parseCondSource(t, base === null ? null : base + off);
   return nested ? [nested] : null;
 }
 
@@ -424,8 +452,11 @@ function makeBranch(name, children) {
 // `test ? ( … ) : ( … )` and `test && ( … )` as a structural node. Returns null
 // for anything whose branches aren't markup (a ternary picking between two
 // strings, say) — those stay code.
-function parseCondSource(src) {
-  const text = String(src).trim();
+function parseCondSource(src, base = null) {
+  const raw = String(src);
+  const leading = raw.length - raw.trimStart().length;
+  const text = raw.trim();
+  const textBase = base === null ? null : base + leading;
   if (!text) return null;
   const ops = topLevelOps(text);
   const ternary = ops.find((o) => o.op === '?');
@@ -434,8 +465,14 @@ function parseCondSource(src) {
     if (!colon) return null;
     const test = text.slice(0, ternary.at).trim();
     if (!test) return null;
-    const thenKids = branchNodes(text.slice(ternary.at + 1, colon.at));
-    const elseKids = branchNodes(text.slice(colon.at + 1));
+    const thenKids = branchNodes(
+      text.slice(ternary.at + 1, colon.at),
+      textBase === null ? null : textBase + ternary.at + 1
+    );
+    const elseKids = branchNodes(
+      text.slice(colon.at + 1),
+      textBase === null ? null : textBase + colon.at + 1
+    );
     if (!thenKids || !elseKids) return null;
     return {
       id: makeId(),
@@ -451,7 +488,7 @@ function parseCondSource(src) {
   if (!and) return null;
   const test = text.slice(0, and.at).trim();
   if (!test) return null;
-  const kids = branchNodes(text.slice(and.at + 2));
+  const kids = branchNodes(text.slice(and.at + 2), textBase === null ? null : textBase + and.at + 2);
   if (!kids || !kids.length) return null; // `x && null` is not worth a node
   return {
     id: makeId(),
@@ -465,8 +502,8 @@ function parseCondSource(src) {
 // Recognizes conditional markup — {cond ? ( … ) : ( … )}, {cond && ( … )} —
 // and turns it into a 'cond' node whose branches are parsed child trees, so
 // each side is navigable and editable instead of a wall of code.
-function tryParseCond(exprText) {
-  return parseCondSource(exprText.slice(1, -1));
+function tryParseCond(exprText, base = null) {
+  return parseCondSource(exprText.slice(1, -1), base === null ? null : base + 1);
 }
 
 // What made the last parse give up, so the code-view banner can name the
@@ -482,9 +519,25 @@ function bail(nodes, str, at, what) {
 
 // Parses a template string into a node tree.
 // Returns {nodes, clean}; clean=false means unrepresentable content was found.
-function parseTemplate(str) {
+//
+// `base` is the offset of `str` within the file it was read from; pass a
+// number and every node comes back tagged with `start`/`end` source offsets
+// (what locateSelection turns into line numbers). The editor's own parse
+// leaves it null on purpose: offsets describe the file as it was on disk and
+// go stale the moment the model is mutated, so only a fresh parse may use them.
+function parseTemplate(str, base = null) {
   const nodes = [];
   let pos = 0;
+
+  // Tags a node with its source range and returns it — a no-op when offsets
+  // weren't asked for.
+  const at = (node, from, to) => {
+    if (base !== null) {
+      node.start = base + from;
+      node.end = base + to;
+    }
+    return node;
+  };
 
   while (pos < str.length) {
     const lt = str.indexOf('<', pos);
@@ -502,7 +555,7 @@ function parseTemplate(str) {
         (/^\s/.test(text) ? ' ' : '') +
         collapseWhitespace(text) +
         (/\s$/.test(text) ? ' ' : '');
-      nodes.push({ id: makeId(), kind: 'text', value });
+      nodes.push(at({ id: makeId(), kind: 'text', value }, pos, textEnd));
     }
     if (next === -1) break;
 
@@ -513,8 +566,9 @@ function parseTemplate(str) {
       const close = findMatchingBrace(str, br);
       if (close === -1) return bail(nodes, str, br, 'an unclosed { … } expression');
       const exprText = str.slice(br, close + 1);
-      const structural = tryParseMap(exprText) || tryParseCond(exprText);
-      nodes.push(structural || { id: makeId(), kind: 'expr', value: exprText });
+      const exprBase = base === null ? null : base + br;
+      const structural = tryParseMap(exprText, exprBase) || tryParseCond(exprText, exprBase);
+      nodes.push(at(structural || { id: makeId(), kind: 'expr', value: exprText }, br, close + 1));
       pos = close + 1;
       continue;
     }
@@ -523,7 +577,7 @@ function parseTemplate(str) {
     if (str.startsWith('<!--', lt)) {
       const end = str.indexOf('-->', lt + 4);
       if (end === -1) return bail(nodes, str, lt, 'an unclosed <!-- comment');
-      nodes.push({ id: makeId(), kind: 'comment', value: str.slice(lt + 4, end) });
+      nodes.push(at({ id: makeId(), kind: 'comment', value: str.slice(lt + 4, end) }, lt, end + 3));
       pos = end + 3;
       continue;
     }
@@ -532,7 +586,7 @@ function parseTemplate(str) {
     if (/^<!doctype/i.test(str.slice(lt))) {
       const end = str.indexOf('>', lt);
       if (end === -1) return bail(nodes, str, lt, 'an unclosed <!doctype>');
-      nodes.push({ id: makeId(), kind: 'raw-line', value: str.slice(lt, end + 1) });
+      nodes.push(at({ id: makeId(), kind: 'raw-line', value: str.slice(lt, end + 1) }, lt, end + 1));
       pos = end + 1;
       continue;
     }
@@ -553,7 +607,9 @@ function parseTemplate(str) {
     const afterOpen = lt + full.length;
 
     if (selfClose === '/' || (!isComponent && VOID_ELEMENTS.has(name.toLowerCase()))) {
-      nodes.push({ id: makeId(), kind, name, props: parseAttrs(attrs), children: null });
+      nodes.push(
+        at({ id: makeId(), kind, name, props: parseAttrs(attrs), children: null }, lt, afterOpen)
+      );
       pos = afterOpen;
       continue;
     }
@@ -563,30 +619,46 @@ function parseTemplate(str) {
       const close = str.indexOf(`</${name}`, afterOpen);
       if (close === -1) return bail(nodes, str, lt, `an unclosed <${name}> block`);
       const closeEnd = str.indexOf('>', close);
-      nodes.push({
-        id: makeId(),
-        kind: 'raw',
-        name,
-        props: parseAttrs(attrs),
-        inner: str.slice(afterOpen, close),
-      });
+      nodes.push(
+        at(
+          {
+            id: makeId(),
+            kind: 'raw',
+            name,
+            props: parseAttrs(attrs),
+            inner: str.slice(afterOpen, close),
+          },
+          lt,
+          closeEnd + 1
+        )
+      );
       pos = closeEnd + 1;
       continue;
     }
 
     const closeIdx = findMatchingClose(str, afterOpen, name);
     if (closeIdx === -1) return bail(nodes, str, lt, `an unclosed <${name}> tag`);
-    const innerResult = parseTemplate(str.slice(afterOpen, closeIdx));
+    const innerResult = parseTemplate(
+      str.slice(afterOpen, closeIdx),
+      base === null ? null : base + afterOpen
+    );
     if (!innerResult.clean) return { nodes, clean: false }; // the inner frame recorded the cause
-    nodes.push({
-      id: makeId(),
-      kind,
-      name,
-      props: parseAttrs(attrs),
-      children: innerResult.nodes,
-    });
     // The close tag may contain whitespace: </Name >
-    pos = str.indexOf('>', closeIdx) + 1;
+    const tagEnd = str.indexOf('>', closeIdx) + 1;
+    nodes.push(
+      at(
+        {
+          id: makeId(),
+          kind,
+          name,
+          props: parseAttrs(attrs),
+          children: innerResult.nodes,
+        },
+        lt,
+        tagEnd
+      )
+    );
+    pos = tagEnd;
   }
 
   return { nodes, clean: true };
@@ -629,10 +701,14 @@ function collapseWhitespace(text) {
 // model = {imports, extraFrontmatter, nodes: tree}. The page's layout wrapper
 // (if any) stays in the tree as a regular node with the well-known id
 // 'layout', so nodes can live before/after it at the top level.
-function parsePage(source) {
+// `opts.locs` records source offsets on every node and the body's own start
+// offset on the model — for reading a location out of the file on disk, not
+// for the editor's live model (see parseTemplate).
+function parsePage(source, opts = {}) {
   const fm = source.match(/^---\r?\n(?:([\s\S]*?)\r?\n)?---\r?\n?/);
   const frontmatter = fm ? fm[1] || '' : '';
-  const body = fm ? source.slice(fm[0].length) : source;
+  const bodyStart = fm ? fm[0].length : 0;
+  const body = source.slice(bodyStart);
 
   const imports = [];
   let extraFrontmatter = frontmatter;
@@ -681,7 +757,7 @@ function parsePage(source) {
   extraFrontmatter = extraFrontmatter.trim();
 
   lastBail = null;
-  const { nodes: topNodes, clean } = parseTemplate(body);
+  const { nodes: topNodes, clean } = parseTemplate(body, opts.locs ? bodyStart : null);
   if (!clean) {
     // Name the construct and point at it. The bail records the text it stopped
     // on, so find that text back in the file for a line number — far more
@@ -747,7 +823,10 @@ function parsePage(source) {
   };
   markDynamic(topNodes);
 
-  return { editable: true, model: { imports, extraFrontmatter, nodes: topNodes } };
+  return {
+    editable: true,
+    model: { imports, extraFrontmatter, nodes: topNodes, ...(opts.locs ? { bodyStart } : {}) },
+  };
 }
 
 // Writes the import block. Named specifiers that share a module are emitted
@@ -1900,7 +1979,7 @@ function serializeNodes(nodes) {
 
 let chunkGroupId = 1;
 
-function resolveChunks(model, pagePath) {
+function resolveChunks(model, pagePath, opts = {}) {
   // ident -> absolute chunk file path
   const rawImports = new Map();
   for (const imp of model.imports) {
@@ -1926,7 +2005,12 @@ function resolveChunks(model, pagePath) {
 
   const parseChunkFile = (filePath) => {
     try {
-      const { nodes, clean } = parseTemplate(fs.readFileSync(filePath, 'utf8'));
+      // Chunk offsets are into the chunk file, not the page — locateSelection
+      // switches files at the boundary node.
+      const { nodes, clean } = parseTemplate(
+        fs.readFileSync(filePath, 'utf8'),
+        opts.locs ? 0 : null
+      );
       return clean ? nodes : null;
     } catch {
       return null;
@@ -2001,9 +2085,10 @@ function chunkImportMarks(model) {
 }
 
 // Dev-preview only: the chunk's markup with the same boundary markers the
-// page serializer emits, numbered from the Fragment's (or group's) path so
-// chunk nodes address identically to the app's tree. A group also gets a
-// marker pair of its own — nothing in the page wraps it. Returns null when
+// page serializer emits, numbered from the Fragment's (or group's) key so
+// chunk nodes address identically to the app's tree. `prefix` is a full
+// "<file>#<path>" key — the file half rides along untouched. A group also gets
+// a marker pair of its own — nothing in the page wraps it. Returns null when
 // the chunk isn't representable, so the caller can serve it unmarked.
 function markChunkHtml(source, prefix, group) {
   const { nodes, clean } = parseTemplate(source);
@@ -2015,8 +2100,81 @@ function markChunkHtml(source, prefix, group) {
   return lines.join('\n') + '\n';
 }
 
+// ---------------------------------------------------------------------------
+// Selection → source location
+// ---------------------------------------------------------------------------
+
+// 1-based line number of a source offset.
+function lineOf(source, offset) {
+  let line = 1;
+  for (let i = 0; i < offset && i < source.length; i++) {
+    if (source[i] === '\n') line++;
+  }
+  return line;
+}
+
+// Where a canvas selection sits in source. `indexPath` is the "0.2.1" half of
+// a "<file>#<path>" node key — '' for the file itself, 'frontmatter' for the
+// frontmatter block. Reads the file from disk and parses it fresh, so the
+// answer describes what an agent opening that file would actually see.
+//
+// The file returned isn't always the one asked for: chunk children are written
+// in the imported .html, not in the page that pulls it in. A node with no
+// range of its own (an unrepresentable file, a synthetic chunk group, a path
+// that no longer resolves) comes back as a bare file.
+function locateSelection(absPath, indexPath) {
+  let source;
+  try {
+    source = fs.readFileSync(absPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const bare = { file: absPath };
+  if (!indexPath) return bare;
+
+  const parsed = parsePage(source, { locs: true });
+  if (!parsed.editable) return bare;
+  if (indexPath === 'frontmatter') {
+    return parsed.model.bodyStart
+      ? { file: absPath, startLine: 1, endLine: lineOf(source, parsed.model.bodyStart - 1) }
+      : bare;
+  }
+  resolveChunks(parsed.model, absPath, { locs: true });
+
+  let file = absPath;
+  let list = parsed.model.nodes;
+  let node = null;
+  for (const part of indexPath.split('.')) {
+    // Stepping past a chunk boundary: everything below it is written in the
+    // chunk file, while the boundary node itself belongs to the page.
+    if (node?.chunkFile) file = node.chunkFile;
+    node = Array.isArray(list) ? list[Number(part)] : null;
+    if (!node) return { file };
+    list = node.children;
+  }
+  if (typeof node.start !== 'number') return { file };
+
+  let text = source;
+  if (file !== absPath) {
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      return { file };
+    }
+  }
+  // Text nodes run from the end of the previous tag, so their range starts and
+  // ends in whitespace on lines that hold nothing else. Tighten it to the
+  // lines the content is actually on.
+  let start = node.start;
+  let end = Math.min(node.end, text.length);
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  return { file, startLine: lineOf(text, start), endLine: lineOf(text, end - 1) };
+}
+
 module.exports = {
   parsePage,
+  locateSelection,
   serializePage,
   serializePageMarked,
   parseTemplate,
